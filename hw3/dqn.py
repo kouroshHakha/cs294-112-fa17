@@ -3,12 +3,19 @@ import gym.spaces
 import itertools
 import numpy as np
 import random
-import tensorflow                as tf
+import tensorflow as tf
 import tensorflow.contrib.layers as layers
 from collections import namedtuple
 from dqn_utils import *
 
+import matplotlib.pyplot as plt
+import pickle
+import os
+
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs", "lr_schedule"])
+
+def report(tag, tsr):
+    print("[{}] {} : {}".format(tag, tsr.name, tsr.get_shape()))
 
 def learn(env,
           q_func,
@@ -129,7 +136,34 @@ def learn(env,
     
     # YOUR CODE HERE
 
+    q_nn = q_func(obs_t_float, num_actions, scope="q_func", reuse=False)
+    target_nn = q_func(obs_tp1_float, num_actions, scope="target_q_func", reuse=False)
+
+    # important trick??
+    # for each transition sample get Q(s,a) of the observed action and state, Q is from Q NN
+    # first translate each action to its one-hot encoding so it has one element of 1 and otherwise 0.
+    # then element wise multiplication would only have the right Q(s,a) in each row.
+    # sum over each row to get the right Q(s,a) as a tensor
+    q_t = tf.reduce_sum(q_nn*tf.one_hot(act_t_ph, num_actions), axis=1)
+
+    # for each transition sample get target = r + gamma * max_ap(Q(sp,ap)), Q is from target NN
+    max_q_tp = tf.reduce_max(target_nn, axis=1)
+    target = rew_t_ph + gamma * max_q_tp * (1 - done_mask_ph)
+    best_actions_target_nn = tf.argmax(target_nn, axis=1)
+
+
+    total_error = tf.reduce_mean(tf.square(q_t - target))
+    q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
+    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
+
     ######
+
+    report("q_nn", q_nn)
+    report("target_q_nn", target_nn)
+    report("max_target_q_nn", max_q_tp)
+    report("target", target)
+    report("act_t_ph", act_t_ph)
+    report("total_error", total_error)
 
     # construct optimization op (with gradient clipping)
     learning_rate = tf.placeholder(tf.float32, (), name="learning_rate")
@@ -156,6 +190,11 @@ def learn(env,
     best_mean_episode_reward = -float('inf')
     last_obs = env.reset()
     LOG_EVERY_N_STEPS = 10000
+
+    # values for plotting
+    x_list = []
+    episodes_100_reward = []
+    best_mean_reward = []
 
     for t in itertools.count():
         ### 1. Check stopping criterion
@@ -196,6 +235,31 @@ def learn(env,
         
         # YOUR CODE HERE
 
+        # store last observation in the replay buffer
+        last_frame_index = replay_buffer.store_frame(last_obs)
+        recent_obs = replay_buffer.encode_recent_observation()
+
+        # epsilon greedy algorithm
+        epsilon = exploration.value(t)
+        p = np.random.rand()
+
+        if (p < epsilon or not model_initialized):
+            # do something with probability of epsilon (e.g. explore)
+            # print ("random policy ... ")
+            action = np.random.randint(num_actions)
+        else:
+            # do something with probability of 1 - epsilon (e.g. exploit)
+            # print ("following policy ... ")
+            action = session.run(best_actions_target_nn, feed_dict={obs_tp1_ph: [recent_obs]})
+
+        last_obs, reward, done, info = env.step(action)
+
+        # if game is over with the action agent took reset the game
+        if (done):
+            last_obs = env.reset()
+
+        # save reward, and done in the buffer
+        replay_buffer.store_effect(last_frame_index,action, reward, done)
         #####
 
         # at this point, the environment should have been advanced one step (and
@@ -214,6 +278,9 @@ def learn(env,
             # replay buffer code for function definition, each batch that you sample
             # should consist of current observations, current actions, rewards,
             # next observations, and done indicator).
+
+            obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = replay_buffer.sample(batch_size)
+
             # 3.b: initialize the model if it has not been initialized yet; to do
             # that, call
             #    initialize_interdependent_variables(session, tf.global_variables(), {
@@ -224,6 +291,13 @@ def learn(env,
             # the current and next time step. The boolean variable model_initialized
             # indicates whether or not the model has been initialized.
             # Remember that you have to update the target network too (see 3.d)!
+            if not model_initialized:
+                print ("Initializing Network ...")
+                initialize_interdependent_variables(session, tf.global_variables(),
+                                                    {obs_t_ph: obs_batch,
+                                                    obs_tp1_ph: next_obs_batch})
+                model_initialized = True
+
             # 3.c: train the model. To do this, you'll need to use the train_fn and
             # total_error ops that were created earlier: total_error is what you
             # created to compute the total Bellman error in a batch, and train_fn
@@ -238,22 +312,40 @@ def learn(env,
             # (this is needed for computing total_error)
             # learning_rate -- you can get this from optimizer_spec.lr_schedule.value(t)
             # (this is needed by the optimizer to choose the learning rate)
+
+            optimizer_lr = optimizer_spec.lr_schedule.value(t)
+
+            feed_dict = {obs_t_ph: obs_batch,
+                         act_t_ph: act_batch,
+                         rew_t_ph: rew_batch,
+                         obs_tp1_ph: next_obs_batch,
+                         done_mask_ph: done_batch,
+                         learning_rate: optimizer_lr}
+            error, _ = session.run([total_error, train_fn], feed_dict)
+
             # 3.d: periodically update the target network by calling
             # session.run(update_target_fn)
             # you should update every target_update_freq steps, and you may find the
             # variable num_param_updates useful for this (it was initialized to 0)
-            #####
-            
+            if (t % target_update_freq == 0):
+                print ("update of target network in progress ...")
+                session.run(update_target_fn)
+                num_param_updates += 1
+
             # YOUR CODE HERE
 
             #####
 
-        ### 4. Log progress
+        ### 4. Log progress and store data for plotting
+        x_list.append(t)
+
         episode_rewards = get_wrapper_by_name(env, "Monitor").get_episode_rewards()
         if len(episode_rewards) > 0:
             mean_episode_reward = np.mean(episode_rewards[-100:])
+            episodes_100_reward.append(mean_episode_reward)
         if len(episode_rewards) > 100:
             best_mean_episode_reward = max(best_mean_episode_reward, mean_episode_reward)
+            best_mean_reward.append(best_mean_episode_reward)
         if t % LOG_EVERY_N_STEPS == 0 and model_initialized:
             print("Timestep %d" % (t,))
             print("mean reward (100 episodes) %f" % mean_episode_reward)
@@ -262,3 +354,21 @@ def learn(env,
             print("exploration %f" % exploration.value(t))
             print("learning_rate %f" % optimizer_spec.lr_schedule.value(t))
             sys.stdout.flush()
+
+    filename = "atari.pickle"
+    file_dir = os.path.join("data", filename)
+    data = {'t': x_list, 'mean_episode_reward': mean_episode_reward, 'episodes_100_reward': episodes_100_reward}
+
+    with open(file_dir, 'wb') as handle:
+        pickle.dump(data, handle)
+
+
+    plt.subplot(211)
+    plt.plot(x_list, mean_episode_reward, lw=2)
+    plt.xlabel("time steps")
+    plt.ylabel("mean episode reward")
+
+    plt.subplot(212)
+    plt.plot(x_list, episodes_100_reward, lw=2)
+    plt.xlabel("time steps")
+    plt.ylabel("best mean reward")
